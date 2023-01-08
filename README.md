@@ -1,0 +1,1 @@
+# EFI-macOS-Monterey-12.6.2
