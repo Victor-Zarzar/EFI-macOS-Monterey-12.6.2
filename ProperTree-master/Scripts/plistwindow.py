@@ -428,6 +428,12 @@ class PlistWindow(tk.Toplevel):
         self._tree.bind("<{}-Left>".format(key), self.cycle_bool)
         self._tree.bind("<{}-Right>".format(key), self.cycle_bool)
 
+        # Set up cmd/ctrl+number key binds to change types as needed
+        menu_max = len(self._get_menu_commands(self.type_menu))
+        for i in range(menu_max):
+            self._tree.bind("<{}-Key-{}>".format(key,i+1), lambda x:self.set_type_by_index(x))
+            self._tree.bind("<{}-KP_{}>".format(key,i+1), lambda x:self.set_type_by_index(x))
+
         # Set expansion bindings
         self._tree.bind("<Shift-Right>", lambda x:self.expand_children())
         self._tree.bind("<Shift-Left>", lambda x:self.collapse_children())
@@ -544,8 +550,11 @@ class PlistWindow(tk.Toplevel):
 
         # Set find_frame bindings - also bind to child widgets to ensure keybinds are captured
         def set_frame_binds(widget):
-            for k,i in (("Up",False),("Down",True)):
-                widget.bind("<{}-{}>".format(key,k), lambda x:self.cycle_find_type(increment=i))
+            for k in ("Up","Down"):
+                widget.bind("<{}-{}>".format(key,k), lambda x:self.cycle_find_type(x))
+            for i,opt in enumerate(self.f_options,start=1):
+                widget.bind("<{}-Key-{}>".format(key,i), lambda x:self.set_find_type_by_index(x))
+                widget.bind("<{}-KP_{}>".format(key,i), lambda x:self.set_find_type_by_index(x))
             for child in widget.children.values():
                 set_frame_binds(child)
         set_frame_binds(self.find_frame)
@@ -555,6 +564,10 @@ class PlistWindow(tk.Toplevel):
         self._tree.pack(side="bottom",fill="both",expand=True)
         self.draw_frames()
         self.entry_popup = None
+
+    def _get_menu_commands(self, menu = None, label = False):
+        if not menu: return []
+        return [menu.entrycget(i,"label") if label else i for i in range(menu.index(tk.END)+1) if menu.type(i) == "command"]
 
     def scrollbar_set(self, *args):
         # Intercepted scrollbar set method to set where our
@@ -620,20 +633,31 @@ class PlistWindow(tk.Toplevel):
             b.extend([a.lower() if lower else a for a in x.split("/")])
         return b
 
+    def set_find_type_by_index(self, index = None, zero_based = False):
+        if not isinstance(index,int):
+            # Try to get the keysym
+            try: index = int(getattr(index,"keysym",None).replace("KP_",""))
+            except: return # Borked value
+        if not zero_based: index -= 1 # original index started at 1, normalize to 0-based
+        if index < 0 or index >= len(self.f_options): return # Out of range
+        self.f_title.set(self.f_options[index])
+        self.change_find_type(self.f_options[index])
+        return "break" # Prevent the keypress from cascading
+
     def change_find_type(self, value):
         self.find_type = value
 
-    def cycle_find_type(self, increment = True):
+    def cycle_find_type(self, event = None):
+        # Use the value if bool, or try to extract the keysym property
+        increment = event if isinstance(event,bool) else {"Up":False,"Down":True}.get(getattr(event,"keysym",None))
+        if increment is None: return # Not sure why this was fired?
         # Set our type to the next in the list
         value = self.f_title.get()
         try: curr,end = self.f_options.index(value),len(self.f_options)
-        except: return "break" # Menu is janked?
+        except: return # Menu is janked?
         mod = 1 if increment else -1
-        # Apply the modifier and check type
-        next_value = self.f_options[(curr+mod) % end]
-        self.f_title.set(next_value)
-        self.change_find_type(next_value)
-        return "break" # Prevent the keypress from cascading
+        # Return set_find_type_by_index's return to prevent keypress cascading as needed
+        return self.set_find_type_by_index((curr+mod)%end,zero_based=True)
 
     def qualify_value(self, value, value_type):
         value_type = value_type.lower()
@@ -1048,9 +1072,9 @@ class PlistWindow(tk.Toplevel):
             name = os.path.basename(item.get("Path",item.get("BundlePath","Unknown Name")))
             # Check the keys containing "path"
             for key in item:
-                if "path" in key.lower() and isinstance(item[key],str) and len(item[key])>self.safe_path_length:
+                if "path" in key.lower() and isinstance(item[key],(str,unicode)) and len(item[key])>self.safe_path_length:
                     paths_too_long.append(key) # Too long - keep a reference of the key
-        elif isinstance(item,str):
+        elif isinstance(item,(str,unicode)):
             name = os.path.basename(item) # Retain the last path component as the name
             # Checking the item itself
             if len(item)>self.safe_path_length:
@@ -1243,9 +1267,13 @@ class PlistWindow(tk.Toplevel):
                 try:
                     with open(plist_full_path,"rb") as f:
                         info_plist = plist.load(f)
+                    if not "CFBundleIdentifier" in info_plist or not isinstance(info_plist["CFBundleIdentifier"],(str,unicode)):
+                        continue # Requires a valid CFBundleIdentifier string
                     kinfo = {
-                        "CFBundleIdentifier": info_plist.get("CFBundleIdentifier",None),
-                        "OSBundleLibraries": info_plist.get("OSBundleLibraries",[])
+                        "CFBundleIdentifier": info_plist["CFBundleIdentifier"],
+                        "OSBundleLibraries": info_plist.get("OSBundleLibraries",[]),
+                        "cfbi": info_plist["CFBundleIdentifier"].lower(), # Case insensitive
+                        "osbl": [x.lower() for x in info_plist.get("OSBundleLibraries",[]) if isinstance(x,(str,unicode))] # Case insensitive
                     }
                     if info_plist.get("CFBundleExecutable",None):
                         if not os.path.exists(os.path.join(path,name,"Contents","MacOS",info_plist["CFBundleExecutable"])):
@@ -1280,8 +1308,8 @@ class PlistWindow(tk.Toplevel):
         for x in new_kexts:
             x = next((y for y in kext_list if y[0].get("BundlePath","") == x.get("BundlePath","")),None)
             if not x: continue
-            parents = [next(((z,y[1]) for z in new_kexts if z.get("BundlePath","") == y[0].get("BundlePath","")),[]) for y in kext_list if y[1].get("CFBundleIdentifier",None) in x[1].get("OSBundleLibraries",[])]
-            children = [next((z for z in new_kexts if z.get("BundlePath","") == y[0].get("BundlePath","")),[]) for y in kext_list if x[1].get("CFBundleIdentifier",None) in y[1].get("OSBundleLibraries",[])]
+            parents = [next(((z,y[1]) for z in new_kexts if z.get("BundlePath","") == y[0].get("BundlePath","")),[]) for y in kext_list if y[1].get("cfbi",None) in x[1].get("osbl",[])]
+            children = [next((z for z in new_kexts if z.get("BundlePath","") == y[0].get("BundlePath","")),[]) for y in kext_list if x[1].get("cfbi",None) in y[1].get("osbl",[])]
             parents = [y for y in parents if not y[0] in children and not y[0].get("BundlePath","") == x[0].get("BundlePath","")]
             unordered_kexts.append({
                 "kext":x[0],
@@ -1294,16 +1322,16 @@ class PlistWindow(tk.Toplevel):
             if len(kext["parents"]):
                 # Gather a list of enabled/disabled parents - and ensure we properly populate
                 # our disabled_parents list
-                enabled_parents = [x[1].get("CFBundleIdentifier") for x in kext["parents"] if x[0].get("Enabled")]
-                disabled_add = [x for x in kext["parents"] if x[0].get("Enabled") == False and not x[1].get("CFBundleIdentifier") in enabled_parents and not any((x[1].get("CFBundleIdentifier")==y[1].get("CFBundleIdentifier") for y in disabled_parents))]
+                enabled_parents = [x[1].get("cfbi") for x in kext["parents"] if x[0].get("Enabled")]
+                disabled_add = [x for x in kext["parents"] if x[0].get("Enabled") == False and not x[1].get("cfbi") in enabled_parents and not any((x[1].get("cfbi")==y[1].get("cfbi") for y in disabled_parents))]
                 # Get any existing kext we're referencing
                 k = next((x for x in original_kexts if x.get("BundlePath")==kext["kext"].get("BundlePath")),None)
                 if not k or k.get("Enabled"):
                     for p in kext["parents"]:
-                        p_cf = p[1].get("CFBundleIdentifier")
+                        p_cf = p[1].get("cfbi")
                         if not p_cf: continue # Broken - can't check
                         if p_cf in enabled_parents: continue # Already have an enabled copy
-                        if any((p_cf == x[1].get("CFBundleIdentifier") for x in disabled_parents)):
+                        if any((p_cf == x[1].get("cfbi") for x in disabled_parents)):
                             continue # Already have a warning copy
                         disabled_parents.append(p)
                 if not all(x[0] in ordered_kexts for x in kext["parents"]):
@@ -1344,11 +1372,11 @@ class PlistWindow(tk.Toplevel):
             if not temp_kext.get("Enabled",False): continue
             # Get the original info
             info = next((x for x in kext_list if x[0].get("BundlePath","") == temp_kext.get("BundlePath","")),None)
-            if not info or not info[1].get("CFBundleIdentifier",None): continue # Broken info
+            if not info or not info[1].get("cfbi",None): continue # Broken info
             # Let's see if it's already in enabled_kexts - and compare the Min/Max/Match Kernel options
             temp_min,temp_max = self.get_min_max_from_kext(temp_kext,"MatchKernel" in kext_add)
             # Gather a list of like IDs
-            comp_kexts = [x for x in enabled_kexts if x[1]["CFBundleIdentifier"] == info[1]["CFBundleIdentifier"]]
+            comp_kexts = [x for x in enabled_kexts if x[1]["cfbi"] == info[1]["cfbi"]]
             # Walk the comp_kexts, and disable if we find an overlap
             for comp_info in comp_kexts:
                 comp_kext = comp_info[0]
@@ -1513,7 +1541,7 @@ class PlistWindow(tk.Toplevel):
             formatted = []
             for entry in long_paths:
                 item,name,keys = entry
-                if isinstance(item,str): # It's an older string path
+                if isinstance(item,(str,unicode)): # It's an older string path
                     formatted.append(name)
                 elif isinstance(item,dict):
                     formatted.append("{} -> {}".format(name,", ".join(keys)))
@@ -2568,24 +2596,36 @@ class PlistWindow(tk.Toplevel):
         self.set_bool(self.b_false() if bool_val else self.b_true())
         return "break"
 
+    def set_type_by_index(self, index = None, menu = None, zero_based = False):
+        # Set our type based on index value
+        if not isinstance(index,int):
+            # Try to get the keysym
+            try: index = int(getattr(index,"keysym",None).replace("KP_",""))
+            except: return # Borked value
+        if not menu: # We need to retrieve the menu manually
+            cell = "" if not len(self._tree.selection()) else self._tree.selection()[0]
+            menu = self.root_type_menu if cell in ("",self.get_root_node()) else self.type_menu
+        valid_vals = self._get_menu_commands(menu,label=True)
+        if not valid_vals: return # Menu has no commands
+        if not zero_based: index -= 1 # original index started at 1, normalize to 0-based
+        if index < 0 or index >= len(valid_vals): return # Out of range
+        target_index = menu.index(valid_vals[index])
+        if target_index is None: return # Nothing found
+        menu.invoke(target_index)
+        return "break" # Prevent the keypress from cascading
+
     def cycle_type(self, increment = True):
         # Set our type to the next in the list
         cell = "" if not len(self._tree.selection()) else self._tree.selection()[0]
         value = self.get_check_type(cell)
         menu = self.root_type_menu if cell in ("",self.get_root_node()) else self.type_menu
-        curr,end = menu.index(value),menu.index(tk.END)
-        if end is None or curr is None: return "break" # Menu is janked?
+        valid_vals = self._get_menu_commands(menu,label=True)
+        if not valid_vals: return # Menu has no commands
+        try: curr = valid_vals.index(value)
+        except: return # Our current value isn't in the menu?
         mod = 1 if increment else -1
-        next_index = curr # default to our current index
-        for x in range(2):
-            # Apply the modifier and check type
-            next_index = (next_index+mod) % (end+1)
-            if menu.type(next_index) == "command": break
-        if menu.type(next_index) != "command":
-            return "break" # Never found one, bail.
-        # Invoke the original command
-        menu.invoke(next_index)
-        return "break" # Prevent the keypress from cascading
+        # Return set_type_by_index's return to prevent keypress cascading as needed
+        return self.set_type_by_index((curr+mod)%len(valid_vals),menu=menu,zero_based=True)
 
     def change_type(self, value, cell = None):
         # Need to walk the values and pad

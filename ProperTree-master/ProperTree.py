@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-import sys, os, binascii, base64, json, re, subprocess, webbrowser
+import sys, os, binascii, base64, json, re, subprocess, webbrowser, multiprocessing
 from collections import OrderedDict
 try:
     import Tkinter as tk
@@ -23,8 +23,40 @@ except NameError:  # Python 3
 sys.path.append(os.path.abspath(os.path.dirname(os.path.realpath(__file__))))
 from Scripts import plist, plistwindow, downloader
 
+def _check_for_update(queue, version_url, user_initiated = False):
+    try:
+        dl = downloader.Downloader()
+    except:
+        return queue.put({
+            "exception":"Could not initialize the downloader.",
+            "error":"An Error Occurred Initializing The Downloader",
+            "user_initiated":user_initiated
+        })
+    try:
+        json_string = dl.get_string(version_url,False)
+    except:
+        return queue.put({
+            "exception":"Could not get version data from github.  Potentially a network issue.",
+            "error":"An Error Occurred Checking For Updates",
+            "user_initiated":user_initiated
+        })
+    try:
+        json_data = json.loads(json_string)
+    except:
+        return queue.put({
+            "exception":"Could not serialize returned JSON data.",
+            "error":"An Error Occurred Checking For Updates",
+            "user_initiated":user_initiated
+        })
+    queue.put({
+        "json":json_data,
+        "user_initiated":user_initiated
+    })
+
 class ProperTree:
     def __init__(self, plists = []):
+        # Create a new queue for multiprocessing
+        self.queue = multiprocessing.Queue()
         # Create the new tk object
         self.tk = tk.Tk()
         self.tk.withdraw() # Try to remove before it's drawn
@@ -96,7 +128,7 @@ class ProperTree:
         int_label.grid(row=9,column=0,sticky="w",padx=10)
         self.int_type_menu.grid(row=9,column=1,sticky="we",padx=10)
         self.bool_type_string = tk.StringVar(self.settings_window)
-        self.bool_type_menu = tk.OptionMenu(self.settings_window, self.bool_type_string, "True/False", "YES/NO", "On/Off", "1/0", command=self.change_bool_type)
+        self.bool_type_menu = tk.OptionMenu(self.settings_window, self.bool_type_string, "True/False", "YES/NO", "On/Off", "1/0", u"\u2714/\u274c", command=self.change_bool_type)
         bool_label = tk.Label(self.settings_window,text="Boolean Display Default:")
         bool_label.grid(row=10,column=0,sticky="w",padx=10)
         self.bool_type_menu.grid(row=10,column=1,sticky="we",padx=10)
@@ -199,8 +231,8 @@ class ProperTree:
         self.notify_once_int = tk.IntVar()
         self.notify_once_check = tk.Checkbutton(self.settings_window,text="Only Notify Once Per Version",variable=self.notify_once_int,command=self.notify_once)
         self.notify_once_check.grid(row=17,column=0,sticky="w",padx=10,pady=(0,10))
-        update_button = tk.Button(self.settings_window,text="Check Now",command=lambda:self.check_for_updates(user_initiated=True))
-        update_button.grid(row=17,column=1,sticky="w",padx=10,pady=(0,10))
+        self.update_button = tk.Button(self.settings_window,text="Check Now",command=lambda:self.check_for_updates(user_initiated=True))
+        self.update_button.grid(row=17,column=1,sticky="w",padx=10,pady=(0,10))
         reset_settings = tk.Button(self.settings_window,text="Restore All Defaults",command=self.reset_settings)
         reset_settings.grid(row=17,column=4,sticky="we",padx=10,pady=(0,10))
 
@@ -412,15 +444,14 @@ class ProperTree:
         os.chdir(cwd)
 
         # Apply the version to the update button text
-        if self.version.get("version"):
-            update_button.configure(text="Check Now ({})".format(self.version.get("version","?.?.?")))
+        self.update_button.configure(text="Check Now ({})".format(self.version.get("version","?.?.?")))
 
         # Setup the settings page to reflect our settings.json file
 
         self.allowed_types = ("XML","Binary")
         self.allowed_data  = ("Hex","Base64")
         self.allowed_int   = ("Decimal","Hex")
-        self.allowed_bool  = ("True/False","YES/NO","On/Off","1/0")
+        self.allowed_bool  = ("True/False","YES/NO","On/Off","1/0",u"\u2714/\u274c")
         self.allowed_conv  = ("Ascii","Base64","Decimal","Hex")
         self.update_settings()
 
@@ -430,16 +461,13 @@ class ProperTree:
         if str(sys.platform) == "darwin": self.update_recents()
         self.check_dark_mode()
 
-        # Attempt to create the downloader class
-        self.dl_error = self.dl = None
-        try: self.dl = downloader.Downloader()
-        except Exception as e: self.dl_error = str(e) # Failed
         self.version_url = "https://raw.githubusercontent.com/corpnewt/ProperTree/master/Scripts/version.json"
         self.repo_url = "https://github.com/corpnewt/ProperTree"
 
-        # Check for updates if need be
+        # Implement a simple boolean lock, and check for updates if needed
+        self.is_checking_for_updates = False
         if self.settings.get("check_for_updates_at_startup",True):
-            self.check_for_updates(user_initiated=False)
+            self.tk.after(0, lambda:self.check_for_updates(user_initiated=False))
 
         # Prior implementations tried to wait 250ms to give open_plist_from_app()
         # enough time to parse anything double-clicked.  The issue was that both
@@ -533,28 +561,57 @@ class ProperTree:
         return None
 
     def check_for_updates(self, user_initiated = False):
-        # Attempts to download the latest version.json and compare to our local copy
-        if self.dl is None:
+        if self.is_checking_for_updates: # Already checking
             if user_initiated:
-                # We pressed the button - but couldn't initialize the downloader class - whine.
+                # We pressed the button - but another check is in progress
                 self.tk.bell()
-                mb.showerror("An Error Occurred Creating The Downloader",self.dl_error)
+                mb.showerror("Already Checking For Updates","An update check is already in progress.  If you consistently get this error when manually checking for updates - it may indicate a netowrk issue.")
             return
-        # We have the downloader - try to gather the info
-        try:
-            newjson = self.dl.get_string(self.version_url,False)
-        except:
+        self.is_checking_for_updates = True # Lock out other update checks
+        self.update_button.configure(
+            state="disabled",
+            text="Checking... ({})".format(self.version.get("version","?.?.?"))
+        )
+        # We'll leverage multiprocessing to avoid UI locks if the update checks take too long
+        p = multiprocessing.Process(target=_check_for_update,args=(self.queue,self.version_url,user_initiated))
+        p.daemon = True
+        p.start()
+        self.check_update_process(p)
+
+    def reset_update_button(self):
+        self.update_button.configure(
+            state="normal",
+            text="Check Now ({})".format(self.version.get("version","?.?.?"))
+        )
+
+    def check_update_process(self, p):
+        # Helper to watch until an update is done
+        if p.is_alive():
+            self.tk.after(100,self.check_update_process,p)
+            return
+        # We've returned - reset our bool lock
+        self.is_checking_for_updates = False
+        # Check if we got anything from the queue
+        if self.queue.empty(): # Nothing in the queue, bail
+            return self.reset_update_button()
+        # Retrieve any returned value and parse
+        output_dict = self.queue.get()
+        user_initiated = output_dict.get("user_initiated",False)
+        # Check if we got an error or exception
+        if "exception" in output_dict or "error" in output_dict:
+            error = output_dict.get("error","An Error Occurred Checking For Updates")
+            excep = output_dict.get("exception","Something went wrong when checking for updates.")
             if user_initiated:
                 self.tk.bell()
-                mb.showerror("An Error Occurred Checking For Updates","Could not get version data from github.  Potentially a network issue.")
-            return
-        try: version_dict = json.loads(newjson)
-        except: version_dict = {}
+                mb.showerror(error,excep)
+            return self.reset_update_button()
+        # Parse the output returned
+        version_dict = output_dict.get("json",{})
         if not version_dict.get("version"):
             if user_initiated:
                 self.tk.bell()
                 mb.showerror("An Error Occurred Checking For Updates","Data returned was malformed or nonexistent.")
-            return
+            return self.reset_update_button()
         # At this point - we should have json data containing the version key/value
         check_version = str(version_dict["version"]).lower()
         our_version   = str(self.version.get("version","0.0.0")).lower()
@@ -563,7 +620,7 @@ class ProperTree:
         if self.compare_version(check_version,our_version) is True:
             if notify_once and last_version == check_version and not user_initiated:
                 # Already notified about this version - ignore
-                return
+                return self.reset_update_button()
             # Save the last version checked
             self.settings["last_version_checked"] = check_version
             # We got an update we're not ignoring - let's prompt
@@ -586,6 +643,7 @@ class ProperTree:
                 title="No Updates Available",
                 message="You are currently running the latest version of ProperTree ({}).".format(our_version)
             )
+        self.reset_update_button()
         # If we got here - we displayed some message, let's lift our window to the top
         windows = self.stackorder(self.tk,include_defaults=True)
         if not len(windows): return
